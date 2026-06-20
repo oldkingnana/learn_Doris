@@ -1,0 +1,19 @@
+behavior_id,user_id,event_type,page_name,city,event_time,order_amount
+1,1001,search,home,Beijing,2026-06-20 09:01:10,0.00
+2,1001,click,restaurant_detail,Beijing,2026-06-20 09:02:33,0.00
+3,1001,order_submit,checkout,Beijing,2026-06-20 09:05:18,58.50
+4,1002,search,home,Shanghai,2026-06-20 10:11:02,i am a amount
+5,1002,click,restaurant_detail,Shanghai,2026-06-20 10:12:44,0.00
+6,1002,order_submit,checkout,Shanghai,2026-06-20 10:18:01,76.00
+7,1003,search,home,Guangzhou,2026-06-20 11:20:50,0.00
+8,1003,click,coupon_page,Guangzhou,2026-06-20 11:21:15,0.00
+9,1004,search,home,Beijing,2026-06-20 12:03:40,0.00
+10,1004,click,restaurant_detail,Beijing,2026-06-20 12:05:21,0.00
+11,1004,order_submit,checkout,Beijing,2026-06-20 12:10:09,42.00
+12,1005,search,home,Shenzhen,2026-06-20 13:30:00,0.00
+13,1005,click,restaurant_detail,Shenzhen,2026-06-20 13:31:12,0.00
+14,1005,order_submit,checkout,Shenzhen,2026-06-20 13:39:45,93.80
+15,1006,search,home,Shanghai,2026-06-20 14:15:27,0.00
+16,1006,click,restaurant_detail,Shanghai,2026-06-20 14:18:03,0.00
+17,1007,search,home,Beijing,2026-06-20 15:44:31,0.00
+18,1007,order_submit,checkout,Beijing,2026-06-20 15:50:10,35.90

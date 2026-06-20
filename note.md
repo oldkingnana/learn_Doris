@@ -217,3 +217,233 @@ ORDER BY behavior_count DESC;
 * 上层的`Merging Exchange`再把多个有序数据流合并成全局有序结果
 * 最终通过`MySQL`协议返回给客户端
 
+### 7 `Query Profile`与数据倾斜
+
+* `EXPLAIN`看的是查询执行前的计划,更像是纸面作战方案
+* `Query Profile`看的是查询执行后的实际表现,可以看到每个`Fragment`/`Pipeline`/`Operator`实际处理了多少行,用了多少时间和内存
+* `enable_profile`是`Session`级变量,所以退出`mariadb`或者换连接之后需要重新开启
+
+```sql
+SET enable_profile = true;
+
+SELECT ...;
+
+SHOW QUERY PROFILE\G
+```
+
+* `SHOW QUERY PROFILE`里通常先看到的是`Profile`列表
+* 在`WebUI`中点开某个`Profile ID`,可以看到更完整的执行树和算子指标
+* 如果看到`Is Cached: Yes`,说明这次可能命中了缓存,执行层指标可能比较少
+* 如果看到`Is Cached: No`,说明这次查询确实执行了,更适合观察扫描/聚合/交换等过程
+
+#### 7.1 `Profile`应该看什么
+
+* 首先看`Summary`
+    1. `Total`:总耗时
+    2. `Is Cached`:是否命中缓存
+    3. `Total Instances Num`:本次查询一共启动了多少执行实例
+    4. `Instances Num Per BE`:每个`BE`上有多少执行实例
+
+* 然后看`PhysicalPlan`
+* 它比详细的`DetailProfile`更适合新手理解整体链路
+* 一条聚合查询大概可能长这样:
+
+```text
+PhysicalOlapScan
+-> PhysicalFilter
+-> PhysicalProject
+-> PhysicalHashAggregate LOCAL
+-> PhysicalDistribute HASH
+-> PhysicalHashAggregate GLOBAL
+-> PhysicalQuickSort LOCAL_SORT
+-> PhysicalDistribute GATHER
+-> PhysicalQuickSort MERGE_SORT
+-> PhysicalResultSink
+```
+
+* 最后看`MergedProfile`
+* `MergedProfile`是把多个并行执行实例做了汇总,常见字段有:
+    1. `sum`:所有实例加起来一共处理多少
+    2. `avg`:平均每个实例处理多少
+    3. `max`:最忙的实例处理多少
+    4. `min`:最闲的实例处理多少
+
+* `avg/max/min`用于判断并行任务是否均匀
+* 比方说:
+
+```text
+ScanRows: sum 42, avg 14, max 38, min 0
+```
+
+* 这说明总共扫描`42`行,平均每个扫描实例`14`行,最多的实例扫了`38`行,最少的实例扫了`0`行
+* 如果`max`远大于`avg/min`,通常说明存在倾斜
+
+#### 7.2 `Operator`的输入端和输出端
+
+* 在`Profile`中可以看到很多`Operator`
+* 有些算子会拆成类似输入端/输出端的形式
+* 比如聚合:
+
+```text
+AGGREGATION_SINK_OPERATOR
+AGGREGATION_OPERATOR
+```
+
+* 可以简单理解为:
+    1. `AGGREGATION_SINK_OPERATOR`:接收数据,构建/更新聚合哈希表
+    2. `AGGREGATION_OPERATOR`:从聚合哈希表中产出结果
+
+* 排序也有类似结构:
+
+```text
+SORT_SINK_OPERATOR
+LOCAL_MERGE_SORT_SOURCE_OPERATOR
+```
+
+* 可以简单理解为:
+    1. `SORT_SINK_OPERATOR`:接收数据,放进排序缓冲区
+    2. `LOCAL_MERGE_SORT_SOURCE_OPERATOR`:从排好序的数据中按顺序产出结果
+
+* 数据交换也类似:
+
+```text
+DATA_STREAM_SINK_OPERATOR
+EXCHANGE_OPERATOR
+```
+
+* 可以简单理解为:
+    1. `DATA_STREAM_SINK_OPERATOR`:把本`Fragment`的数据发送出去
+    2. `EXCHANGE_OPERATOR`:在目标`Fragment`接收远端数据
+
+* 这个规律对读`Profile`很重要,因为它能帮助我们判断数据是在“进入某个状态结构”,还是“从某个状态结构产出”
+
+#### 7.3 `Bucket`/`Tablet`/`BE`和扫描倾斜
+
+* `DISTRIBUTED BY HASH(x) BUCKETS n`会把数据按照字段`x`哈希到多个`Bucket`
+* 在简单理解下,一个`Bucket`通常可以对应到底层的一个`Tablet`
+* `Tablet`会被分配到某个`BE`上
+* 查询时,只有持有相关`Tablet`的`BE`会参与扫描
+
+* 所以并不是启动了`3`个`BE`,每次查询就一定由`3`个`BE`平均执行
+* 真实链路是:
+
+```text
+行数据
+-> 按 DISTRIBUTED BY key hash 到 Bucket/Tablet
+-> Tablet 被分配到某个 BE
+-> 查询时扫描持有相关 Tablet 的 BE
+-> 如果 key 或 Tablet 分布不均,Profile 中 max/min 就会拉开
+```
+
+* `SHOW TABLETS FROM table_name\G`可以看到一张表的`Tablet`实际落在哪些`BE`上
+* `SHOW BACKENDS\G`可以看到每个`BE`的`TabletNum`和`DataUsedCapacity`
+
+#### 7.4 数据倾斜实验结论
+
+* 我们做了三组测试:
+    1. `HASH(city)` + `GROUP BY city`
+    2. `HASH(user_id)` + `GROUP BY city`
+    3. `HASH(user_id)` + `GROUP BY user_id`
+
+* 第一组:`HASH(city)` + `GROUP BY city`
+* 因为大部分数据都是`Beijing`,而表又按`city`分桶,所以扫描阶段就明显倾斜
+
+```text
+RowsProduced: sum 42, avg 14, max 38, min 0
+ScanRows:     sum 42, avg 14, max 38, min 0
+```
+
+* 这说明某些扫描实例处理了绝大多数数据,而有些实例几乎没活
+* 这类问题属于分桶字段本身低基数/分布不均导致的扫描倾斜
+
+* 第二组:`HASH(user_id)` + `GROUP BY city`
+* 按`user_id`分桶后,扫描比第一组均匀一些:
+
+```text
+ScanRows: sum 42, avg 21, max 30, min 12
+```
+
+* 但是查询仍然按照`city`聚合
+* `city`是低基数字段,并且`Beijing`占比很高,所以`Exchange`之后的全局聚合阶段仍然可能集中
+* 这说明分桶字段影响扫描是否均匀,而`GROUP BY`字段影响`Exchange`和后续聚合是否均匀
+
+* 第三组:`HASH(user_id)` + `GROUP BY user_id`
+* 因为扫描的是同一张`behavior_by_user`表,所以扫描倾斜和第二组接近
+* 后来通过`SHOW TABLETS`确认,这张表的`6`个`Tablet`只落在两个`BE`上,其中一个`BE`有`4`个`Tablet`,另一个有`2`个`Tablet`
+* 这解释了为什么只有两个`BE`实际参与扫描,以及为什么扫描行数仍然不均
+* 这说明数据倾斜不仅来自分桶字段,也可能来自`Tablet`到`BE`的物理分布不均
+
+* 对应的`SHOW BACKENDS`中可以看到老`BE`的历史负载明显更高:
+
+```text
+BE1 TabletNum: 51, DataUsedCapacity: 301.452 KB
+BE2 TabletNum: 11, DataUsedCapacity: 7.926 KB
+BE3 TabletNum: 12, DataUsedCapacity: 14.039 KB
+```
+
+* 因此新建表的`Tablet`更偏向落在较空的`BE2/BE3`上是合理现象
+* 不过这类判断需要结合`SHOW TABLETS`和`SHOW BACKENDS`,不能只靠`Profile`猜
+
+* 本轮实验最重要的结论:
+
+```text
+1. 分桶 key 倾斜会导致 scan 倾斜
+2. GROUP BY / JOIN key 倾斜会导致 Exchange 和聚合倾斜
+3. Tablet 到 BE 的物理分布不均,也会导致 scan 倾斜
+```
+
+### 8 接下来如何进入源码
+
+* 不应该试图一开始读完整个`Doris`源码
+* 开源项目和公司项目一样,通常都是不同模块各自负责不同边界
+* 源码阅读更合理的方式是先按组件边界理解数据流:
+
+```text
+这个组件从哪里拿数据
+这个组件内部做了什么处理
+这个组件把结果交给谁
+```
+
+* 所以下一步不是“把所有源码读完”,而是选择一个已经在使用层理解过的链路,按模块边界进入源码
+
+#### 8.1 第一条源码主线:查询执行链路
+
+* 优先选择查询执行链路,因为我们已经通过`EXPLAIN`和`Query Profile`看到它的宏观形态
+* 目标不是马上理解所有优化器和执行引擎细节,而是先回答:
+
+```text
+SQL 从 FE 进来后如何变成执行计划
+执行计划如何切成 Fragment
+Fragment 如何下发给 BE
+BE 如何通过 Pipeline/Operator 执行
+Operator 指标如何进入 Query Profile
+结果如何回到客户端
+```
+
+* 可以先按这些组件看:
+    1. `FE`的`SQL`解析与计划生成
+    2. `FE`的`Fragment`调度与下发
+    3. `BE`的`Pipeline`执行框架
+    4. `OLAP_SCAN_OPERATOR`如何从`Tablet`读数据
+    5. `AGGREGATION_OPERATOR`如何做聚合
+    6. `DATA_STREAM_SINK_OPERATOR`/`EXCHANGE_OPERATOR`如何交换数据
+    7. `SORT_OPERATOR`如何排序
+    8. `Query Profile`如何收集和展示指标
+
+#### 8.2 源码阅读边界
+
+* 每次只解决一个小问题
+* 比方说第一轮只看:
+
+```text
+Profile 中的 ScanRows / RowsProduced / InputRows 是在哪里记录的?
+```
+
+* 或者:
+
+```text
+EXPLAIN 中的 PhysicalOlapScan / PhysicalHashAggregate / PhysicalDistribute 是怎么对应到 BE 的 Operator 的?
+```
+
+* 暂时不追求搞懂所有`CBO`规则,也不追求读完所有`BE`执行层源码
+* 先把组件之间的数据流画出来,再逐步深入单个组件
